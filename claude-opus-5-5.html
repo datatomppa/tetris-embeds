@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<!--
+  FLIP TETRIS: a single-file Tetris clone where gravity flips every 20 seconds.
+
+  Assumptions / design decisions:
+  - Board is 12 columns wide and 24 rows tall. Seven standard tetrominoes, 7-bag randomizer
+    driven by a fixed-seed PRNG (mulberry32, seed 0x5EED1234), so every load plays the same sequence.
+  - Controls: Left/Right move, Up rotates clockwise (with simple wall kicks), Down soft-drops
+    and Space hard-drops, both in the CURRENT gravity direction. Space/Enter restarts after game over.
+  - Pieces spawn at the edge opposite gravity (the top when gravity is down, the bottom when it is up),
+    just clear of any stack already sitting on that edge in the columns the piece spawns in.
+    It's game over if a new piece overlaps locked blocks where it spawns.
+  - Each locked block belongs to the floor stack or the ceiling stack, depending on gravity at the
+    moment it locked (the starting stack belongs to the floor). When a row is full it clears
+    (whichever stack it is in). Floor-stack blocks beyond it move down one row and ceiling-stack blocks
+    beyond it move up one row, so each stack collapses toward its own wall. A gravity flip never moves
+    locked blocks. A piece still falling when gravity flips just reverses direction.
+  - A piece locks on the gravity tick where it can't move any further (no extra lock delay).
+  - Speed starts at 1 row/second and gets 80 ms faster every 10 lines (minimum 100 ms).
+    Score: 100/300/500/800 x (level+1) for 1/2/3/4 lines, +1 per soft-drop row, +2 per hard-drop row.
+  - Autoplay: picks the leftmost column where the stack the piece is falling toward is lowest, then
+    lines up the piece's leftmost block with that column (clamped so the piece stays on the board).
+    It never rotates, moves one column every 120 ms, never soft- or hard-drops, and retargets
+    after a flip. Any keydown ends autoplay for the rest of the session.
+  - The flip countdown runs on game time. It stops at game over, and the game effectively
+    pauses while the tab is hidden because the frame delta is capped.
+  - The canvas scales to fit the viewport (board cell size up to 32 px). At 1440x900 everything fits
+    without scrolling.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flip Tetris</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #070913; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+'use strict';
+
+// ---------- Constants ----------
+const COLS = 12, ROWS = 24;
+const FLIP_MS = 20000;
+const AI_MS = 120;
+const SEED = 0x5EED1234;
+const START_STACK = [
+  '###.#####.##',
+  '#####.######',
+  '##.#########',
+  '########.###'
+];
+// color index: 1..7 = tetromino types I O T S Z J L, 8 = starting stack
+const COLORS = [null, '#22d3ee', '#facc15', '#c084fc', '#4ade80', '#f87171', '#60a5fa', '#fb923c', '#64748b'];
+const SHAPES = [
+  { n: 4, c: [[0,1],[1,1],[2,1],[3,1]] }, // I
+  { n: 2, c: [[0,0],[1,0],[0,1],[1,1]] }, // O
+  { n: 3, c: [[1,0],[0,1],[1,1],[2,1]] }, // T
+  { n: 3, c: [[1,0],[2,0],[0,1],[1,1]] }, // S
+  { n: 3, c: [[0,0],[1,0],[1,1],[2,1]] }, // Z
+  { n: 3, c: [[0,0],[0,1],[1,1],[2,1]] }, // J
+  { n: 3, c: [[2,0],[0,1],[1,1],[2,1]] }  // L
+];
+const ROTS = SHAPES.map(s => {
+  const r = [s.c.map(p => p.slice())];
+  for (let i = 1; i < 4; i++) r.push(r[i - 1].map(([x, y]) => [s.n - 1 - y, x]));
+  return r;
+});
+const BOX = ROTS.map(rs => rs.map(cs => ({
+  minX: Math.min(...cs.map(p => p[0])), maxX: Math.max(...cs.map(p => p[0])),
+  minY: Math.min(...cs.map(p => p[1])), maxY: Math.max(...cs.map(p => p[1]))
+})));
+const LINE_SCORES = [0, 100, 300, 500, 800];
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- State ----------
+let color, tag, rng, bag, piece, nextType;
+let gravity, flipT, dropAcc, aiAcc, score, lines, level, over, flashT;
+let autoplay = true;
+
+function makeGrid() { return Array.from({ length: ROWS }, () => new Array(COLS).fill(0)); }
+
+function reset() {
+  color = makeGrid();
+  tag = makeGrid();
+  START_STACK.forEach((row, i) => {
+    const y = ROWS - START_STACK.length + i;
+    for (let x = 0; x < COLS; x++) if (row[x] === '#') { color[y][x] = 8; tag[y][x] = 0; }
+  });
+  rng = mulberry32(SEED);
+  bag = [];
+  gravity = 1; flipT = 0; dropAcc = 0; aiAcc = 0;
+  score = 0; lines = 0; level = 0; over = false; flashT = 0;
+  nextType = takeFromBag();
+  spawn();
+}
+
+function takeFromBag() {
+  if (!bag.length) {
+    bag = [0, 1, 2, 3, 4, 5, 6];
+    for (let i = bag.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      const t = bag[i]; bag[i] = bag[j]; bag[j] = t;
+    }
+  }
+  return bag.pop();
+}
+
+function fits(t, r, x, y) {
+  const cs = ROTS[t][r];
+  for (let i = 0; i < 4; i++) {
+    const cx = x + cs[i][0], cy = y + cs[i][1];
+    if (cx < 0 || cx >= COLS || cy < 0 || cy >= ROWS || color[cy][cx]) return false;
+  }
+  return true;
+}
+
+function spawn() {
+  const t = nextType;
+  nextType = takeFromBag();
+  const b = BOX[t][0];
+  const x = Math.floor((COLS - (b.maxX - b.minX + 1)) / 2) - b.minX;
+  let y;
+  if (gravity === 1) {
+    // enter from the top, below any ceiling-stack blocks in these columns
+    let edge = -1;
+    for (let c = x + b.minX; c <= x + b.maxX; c++)
+      for (let r = 0; r < ROWS; r++) if (color[r][c] && tag[r][c] === 1) edge = Math.max(edge, r);
+    y = edge + 1 - b.minY;
+  } else {
+    // enter from the bottom, above any floor-stack blocks in these columns
+    let edge = ROWS;
+    for (let c = x + b.minX; c <= x + b.maxX; c++)
+      for (let r = 0; r < ROWS; r++) if (color[r][c] && tag[r][c] === 0) edge = Math.min(edge, r);
+    y = edge - 1 - b.maxY;
+  }
+  piece = { t, r: 0, x, y };
+  dropAcc = 0;
+  aiAcc = 0;
+  if (!fits(t, 0, x, y)) over = true;
+}
+
+function tryMove(dx, dy) {
+  if (fits(piece.t, piece.r, piece.x + dx, piece.y + dy)) { piece.x += dx; piece.y += dy; return true; }
+  return false;
+}
+
+function rotate() {
+  if (piece.t === 1) return; // O does not rotate
+  const nr = (piece.r + 1) % 4;
+  const g = -gravity; // kick against gravity
+  const kicks = [[0,0],[-1,0],[1,0],[-2,0],[2,0],[0,g],[-1,g],[1,g]];
+  for (const [kx, ky] of kicks) {
+    if (fits(piece.t, nr, piece.x + kx, piece.y + ky)) {
+      piece.x += kx; piece.y += ky; piece.r = nr; return;
+    }
+  }
+}
+
+function lock() {
+  const cs = ROTS[piece.t][piece.r];
+  const stackTag = gravity === 1 ? 0 : 1;
+  for (const [dx, dy] of cs) {
+    color[piece.y + dy][piece.x + dx] = piece.t + 1;
+    tag[piece.y + dy][piece.x + dx] = stackTag;
+  }
+  const n = clearLines();
+  if (n) {
+    lines += n;
+    score += (n <= 4 ? LINE_SCORES[n] : n * 200) * (level + 1);
+    level = Math.floor(lines / 10);
+  }
+  spawn();
+}
+
+function clearLines() {
+  let n = 0;
+  for (;;) {
+    let r = -1;
+    for (let y = 0; y < ROWS; y++) if (color[y].every(v => v)) { r = y; break; }
+    if (r < 0 || n > ROWS) break;
+    removeRow(r);
+    n++;
+  }
+  return n;
+}
+
+// Remove row r. Floor-stack blocks above it drop one row, ceiling-stack blocks below it rise one row.
+function removeRow(r) {
+  const nc = makeGrid(), nt = makeGrid();
+  const movers = [];
+  for (let y = 0; y < ROWS; y++) {
+    for (let x = 0; x < COLS; x++) {
+      if (y === r || !color[y][x]) continue;
+      const t = tag[y][x];
+      if (t === 0 && y < r) movers.push([x, y, y + 1, t, color[y][x]]);
+      else if (t === 1 && y > r) movers.push([x, y, y - 1, t, color[y][x]]);
+      else { nc[y][x] = color[y][x]; nt[y][x] = t; }
+    }
+  }
+  for (const [x, y, ny, t, c] of movers) {
+    if (!nc[ny][x]) { nc[ny][x] = c; nt[ny][x] = t; }
+    else if (!nc[y][x]) { nc[y][x] = c; nt[y][x] = t; } // pathological overlap: stay put
+  }
+  color = nc; tag = nt;
+}
+
+function gravityStep() {
+  if (!tryMove(0, gravity)) lock();
+}
+
+function hardDrop() {
+  let n = 0;
+  while (tryMove(0, gravity)) n++;
+  score += 2 * n;
+  lock();
+}
+
+function dropInterval() { return Math.max(100, 1000 - level * 80); }
+
+// ---------- Autoplay ----------
+function stackHeight(c) {
+  if (gravity === 1) {
+    for (let r = 0; r < ROWS; r++) if (color[r][c] && tag[r][c] === 0) return ROWS - r;
+  } else {
+    for (let r = ROWS - 1; r >= 0; r--) if (color[r][c] && tag[r][c] === 1) return r + 1;
+  }
+  return 0;
+}
+
+function aiTargetX() {
+  let best = 0, bestH = Infinity;
+  for (let c = 0; c < COLS; c++) {
+    const h = stackHeight(c);
+    if (h < bestH) { bestH = h; best = c; }
+  }
+  const b = BOX[piece.t][piece.r];
+  return Math.max(-b.minX, Math.min(COLS - 1 - b.maxX, best - b.minX));
+}
+
+function aiMove() {
+  const tx = aiTargetX();
+  if (piece.x < tx) tryMove(1, 0);
+  else if (piece.x > tx) tryMove(-1, 0);
+}
+
+// ---------- Update ----------
+function update(dt) {
+  if (over) return;
+  flipT += dt;
+  if (flipT >= FLIP_MS) {
+    flipT -= FLIP_MS;
+    gravity = -gravity;
+    flashT = 900;
+  }
+  if (autoplay) {
+    aiAcc += dt;
+    while (aiAcc >= AI_MS) { aiAcc -= AI_MS; aiMove(); }
+  }
+  dropAcc += dt;
+  const iv = dropInterval();
+  while (dropAcc >= iv && !over) { dropAcc -= iv; gravityStep(); }
+}
+
+// ---------- Input ----------
+window.addEventListener('keydown', e => {
+  const k = e.key;
+  const isSpace = k === ' ' || k === 'Spacebar' || e.code === 'Space';
+  if (isSpace || k === 'ArrowLeft' || k === 'ArrowRight' || k === 'ArrowUp' || k === 'ArrowDown') e.preventDefault();
+  autoplay = false; // any key hands control to the keyboard
+  if (over) {
+    if ((isSpace || k === 'Enter') && !e.repeat) reset();
+    return;
+  }
+  if (k === 'ArrowLeft') tryMove(-1, 0);
+  else if (k === 'ArrowRight') tryMove(1, 0);
+  else if (k === 'ArrowUp') rotate();
+  else if (k === 'ArrowDown') {
+    if (tryMove(0, gravity)) { score += 1; dropAcc = 0; }
+    else lock();
+  } else if (isSpace) hardDrop();
+});
+
+// ---------- Rendering ----------
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let cell, pad, boardX, boardY, panelX, panelW, W, H;
+
+function resize() {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  cell = Math.floor(Math.min((vh - 24) / (ROWS + 1), (vw - 24) / (COLS + 10)));
+  cell = Math.max(10, Math.min(32, cell));
+  pad = Math.round(cell * 0.5);
+  boardX = pad; boardY = pad;
+  panelX = boardX + COLS * cell + pad;
+  panelW = Math.round(cell * 8.5);
+  W = panelX + panelW + pad;
+  H = ROWS * cell + 2 * pad;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+
+function txt(s, x, y, size, col, align = 'left', weight = '600') {
+  ctx.font = `${weight} ${Math.round(size)}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+  ctx.fillStyle = col;
+  ctx.textAlign = align;
+  ctx.fillText(s, x, y);
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function panelBox(x, y, w, h, border) {
+  roundRect(x, y, w, h, cell * 0.3);
+  ctx.fillStyle = '#10142a';
+  ctx.fill();
+  ctx.lineWidth = border ? 2 : 1;
+  ctx.strokeStyle = border || '#243056';
+  ctx.stroke();
+}
+
+function drawBlock(px, py, s, ci, alpha) {
+  ctx.globalAlpha = alpha === undefined ? 1 : alpha;
+  const e = Math.max(2, Math.round(s * 0.15));
+  ctx.fillStyle = COLORS[ci];
+  ctx.fillRect(px + 1, py + 1, s - 2, s - 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.3)';
+  ctx.fillRect(px + 1, py + 1, s - 2, e);
+  ctx.fillRect(px + 1, py + 1, e, s - 2);
+  ctx.fillStyle = 'rgba(0,0,0,0.28)';
+  ctx.fillRect(px + 1, py + s - 1 - e, s - 2, e);
+  ctx.fillRect(px + s - 1 - e, py + 1, e, s - 2);
+  ctx.globalAlpha = 1;
+}
+
+function drawArrow(cx, cy, len, dir, col) {
+  const hw = len * 0.42, sw = len * 0.13, hl = len * 0.48;
+  const tip = cy + dir * len / 2, tail = cy - dir * len / 2, base = tip - dir * hl;
+  ctx.beginPath();
+  ctx.moveTo(cx - sw, tail); ctx.lineTo(cx + sw, tail);
+  ctx.lineTo(cx + sw, base); ctx.lineTo(cx + hw, base);
+  ctx.lineTo(cx, tip);
+  ctx.lineTo(cx - hw, base); ctx.lineTo(cx - sw, base);
+  ctx.closePath();
+  ctx.fillStyle = col;
+  ctx.fill();
+}
+
+function gravityColor() { return gravity === 1 ? '#38bdf8' : '#fb923c'; }
+
+function drawBoard() {
+  const bw = COLS * cell, bh = ROWS * cell;
+  ctx.fillStyle = '#0b0f20';
+  ctx.fillRect(boardX, boardY, bw, bh);
+
+  // grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.045)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 1; x < COLS; x++) { ctx.moveTo(boardX + x * cell + 0.5, boardY); ctx.lineTo(boardX + x * cell + 0.5, boardY + bh); }
+  for (let y = 1; y < ROWS; y++) { ctx.moveTo(boardX, boardY + y * cell + 0.5); ctx.lineTo(boardX + bw, boardY + y * cell + 0.5); }
+  ctx.stroke();
+
+  // gravity edge glow on the wall pieces are falling toward
+  const gc = gravityColor();
+  const gh = cell * 1.2;
+  const gy = gravity === 1 ? boardY + bh - gh : boardY;
+  const grad = ctx.createLinearGradient(0, gravity === 1 ? boardY + bh : boardY, 0, gravity === 1 ? boardY + bh - gh : boardY + gh);
+  grad.addColorStop(0, gc + '55');
+  grad.addColorStop(1, gc + '00');
+  ctx.fillStyle = grad;
+  ctx.fillRect(boardX, gy, bw, gh);
+
+  // locked blocks
+  for (let y = 0; y < ROWS; y++)
+    for (let x = 0; x < COLS; x++)
+      if (color[y][x]) drawBlock(boardX + x * cell, boardY + y * cell, cell, color[y][x]);
+
+  if (!over && piece) {
+    // ghost
+    let gyOff = 0;
+    while (fits(piece.t, piece.r, piece.x, piece.y + (gyOff + 1) * gravity)) gyOff++;
+    const cs = ROTS[piece.t][piece.r];
+    if (gyOff > 0) {
+      ctx.strokeStyle = COLORS[piece.t + 1];
+      ctx.globalAlpha = 0.45;
+      ctx.lineWidth = 2;
+      for (const [dx, dy] of cs) {
+        ctx.strokeRect(boardX + (piece.x + dx) * cell + 2, boardY + (piece.y + dy + gyOff * gravity) * cell + 2, cell - 4, cell - 4);
+      }
+      ctx.globalAlpha = 1;
+    }
+    for (const [dx, dy] of cs) drawBlock(boardX + (piece.x + dx) * cell, boardY + (piece.y + dy) * cell, cell, piece.t + 1);
+  }
+
+  // border
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#2a3866';
+  ctx.strokeRect(boardX - 1, boardY - 1, bw + 2, bh + 2);
+  ctx.fillStyle = gc;
+  ctx.fillRect(boardX - 1, gravity === 1 ? boardY + bh - 1 : boardY - 3, bw + 2, 4);
+
+  // flip flash
+  if (flashT > 0) {
+    const a = flashT / 900;
+    ctx.fillStyle = `rgba(255,255,255,${0.22 * a})`;
+    ctx.fillRect(boardX, boardY, bw, bh);
+    ctx.globalAlpha = Math.min(1, a * 1.5);
+    txt('GRAVITY FLIP ' + (gravity === 1 ? '\u2193' : '\u2191'), boardX + bw / 2, boardY + bh / 2 - cell * 0.5, cell * 1.0, '#ffffff', 'center', '800');
+    ctx.globalAlpha = 1;
+  }
+
+  if (over) {
+    ctx.fillStyle = 'rgba(5,7,15,0.78)';
+    ctx.fillRect(boardX, boardY, bw, bh);
+    txt('GAME OVER', boardX + bw / 2, boardY + bh / 2 - cell * 2, cell * 1.4, '#f87171', 'center', '800');
+    txt('Score ' + score, boardX + bw / 2, boardY + bh / 2 - cell * 0.2, cell * 0.75, '#f1f5f9', 'center', '700');
+    txt('Press Space to restart', boardX + bw / 2, boardY + bh / 2 + cell * 1.2, cell * 0.55, '#94a3b8', 'center', '600');
+  }
+}
+
+function drawPanel() {
+  const u = cell, x0 = panelX, w = panelW, cx = x0 + w / 2;
+  const gc = gravityColor();
+  let y = boardY;
+
+  txt('FLIP TETRIS', x0, y, u * 0.85, '#f1f5f9', 'left', '800');
+  y += u * 1.3;
+
+  // Gravity indicator
+  panelBox(x0, y, w, u * 5.4, gc);
+  txt('GRAVITY', x0 + u * 0.4, y + u * 0.3, u * 0.45, '#94a3b8', 'left', '700');
+  drawArrow(cx, y + u * 2.75, u * 3.0, gravity, gc);
+  txt(gravity === 1 ? 'DOWN' : 'UP', cx, y + u * 4.5, u * 0.6, gc, 'center', '800');
+  y += u * 5.8;
+
+  // Countdown
+  const remMs = Math.max(0, FLIP_MS - flipT);
+  const rem = remMs / 1000;
+  const urgent = rem <= 3 && !over;
+  panelBox(x0, y, w, u * 3.6, urgent ? '#f87171' : null);
+  txt('NEXT FLIP IN', x0 + u * 0.4, y + u * 0.3, u * 0.45, '#94a3b8', 'left', '700');
+  txt(rem.toFixed(1) + ' s', cx, y + u * 0.95, u * 1.25, urgent ? '#f87171' : '#f1f5f9', 'center', '800');
+  const bx = x0 + u * 0.4, bw = w - u * 0.8, by = y + u * 2.55, bh = Math.max(4, u * 0.35);
+  ctx.fillStyle = '#1e293b';
+  ctx.fillRect(bx, by, bw, bh);
+  ctx.fillStyle = urgent ? '#f87171' : gc;
+  ctx.fillRect(bx, by, bw * (remMs / FLIP_MS), bh);
+  txt('then ' + (gravity === 1 ? 'UP \u2191' : 'DOWN \u2193'), cx, y + u * 3.02, u * 0.38, '#94a3b8', 'center', '600');
+  y += u * 4.0;
+
+  // Score
+  panelBox(x0, y, w, u * 3.4);
+  txt('SCORE', x0 + u * 0.4, y + u * 0.3, u * 0.45, '#94a3b8', 'left', '700');
+  txt(String(score), cx, y + u * 0.85, u * 1.05, '#f1f5f9', 'center', '800');
+  txt('LINES ' + lines + '   LEVEL ' + (level + 1), cx, y + u * 2.4, u * 0.42, '#cbd5e1', 'center', '600');
+  y += u * 3.8;
+
+  // Next piece
+  panelBox(x0, y, w, u * 3.6);
+  txt('NEXT', x0 + u * 0.4, y + u * 0.3, u * 0.45, '#94a3b8', 'left', '700');
+  if (nextType !== undefined) {
+    const b = BOX[nextType][0];
+    const s = Math.round(u * 0.75);
+    const pw = (b.maxX - b.minX + 1) * s, ph = (b.maxY - b.minY + 1) * s;
+    const px = cx - pw / 2, py = y + u * 2.1 - ph / 2;
+    for (const [dx, dy] of ROTS[nextType][0]) drawBlock(px + (dx - b.minX) * s, py + (dy - b.minY) * s, s, nextType + 1);
+  }
+  y += u * 4.0;
+
+  // Mode + controls
+  if (autoplay) {
+    txt('\u25B6 AUTOPLAY DEMO', x0, y, u * 0.5, '#4ade80', 'left', '800');
+    txt('press any key to take control', x0, y + u * 0.62, u * 0.38, '#94a3b8', 'left', '600');
+  } else {
+    txt('\u2328 KEYBOARD CONTROL', x0, y, u * 0.5, '#e2e8f0', 'left', '800');
+  }
+  y += u * 1.4;
+  const controls = [
+    ['\u2190 \u2192', 'move'],
+    ['\u2191', 'rotate'],
+    ['\u2193', 'soft drop (with gravity)'],
+    ['Space', 'hard drop (with gravity)']
+  ];
+  for (const [key, what] of controls) {
+    txt(key, x0, y, u * 0.4, '#f1f5f9', 'left', '700');
+    txt(what, x0 + u * 1.8, y, u * 0.4, '#94a3b8', 'left', '500');
+    y += u * 0.6;
+  }
+}
+
+function render() {
+  ctx.clearRect(0, 0, W, H);
+  ctx.textBaseline = 'top';
+  drawBoard();
+  drawPanel();
+}
+
+// ---------- Main loop ----------
+let last = performance.now();
+function frame(now) {
+  let dt = now - last;
+  last = now;
+  if (dt < 0) dt = 0;
+  if (dt > 100) dt = 100;
+  update(dt);
+  if (flashT > 0) flashT = Math.max(0, flashT - dt);
+  render();
+  requestAnimationFrame(frame);
+}
+
+resize();
+reset();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

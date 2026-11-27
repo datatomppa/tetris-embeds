@@ -1,0 +1,727 @@
+<!doctype html>
+<!-- Assumptions: A flip reverses the active piece, but never moves locked cells. New pieces enter just beyond the stack on their entry side. ArrowDown soft-drops in the current gravity direction. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fall / Rise - Gravity Tetris</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --cell: min(29px, calc((100dvh - 166px) / 24), calc((100vw - 56px) / 12));
+      --ink: #edf5f5;
+      --muted: #8296a5;
+      --accent: #f7c86b;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100dvh;
+      background: radial-gradient(ellipse at 49% 47%, #1c2d38 0, #101b26 39%, #090f18 78%);
+      color: var(--ink);
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: .3;
+      background-image: linear-gradient(#71899a0d 1px, transparent 1px), linear-gradient(90deg, #71899a0d 1px, transparent 1px);
+      background-size: 48px 48px;
+    }
+
+    .shell {
+      position: relative;
+      width: min(1160px, 100%);
+      min-height: 100dvh;
+      margin: auto;
+      padding: 25px 36px 18px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .shell[data-gravity="up"] { --accent: #70e1db; }
+
+    .masthead, .footnote {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    .masthead {
+      min-height: 51px;
+      border-bottom: 1px solid #7892a32d;
+      padding-bottom: 15px;
+    }
+
+    .brand {
+      margin: 0;
+      font-size: 19px;
+      font-weight: 850;
+      letter-spacing: -.05em;
+      text-transform: uppercase;
+    }
+
+    .brand span { color: var(--accent); }
+
+    .eyebrow, .micro {
+      font-size: 10px;
+      font-weight: 750;
+      letter-spacing: .22em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .arena {
+      flex: 1;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+      align-items: center;
+      gap: clamp(20px, 5vw, 75px);
+      padding: 15px 0 12px;
+    }
+
+    .panel {
+      align-self: stretch;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 35px 0 45px;
+      min-width: 0;
+    }
+
+    .panel-right { text-align: right; }
+
+    .panel h2 {
+      margin: 10px 0 0;
+      font-size: clamp(23px, 3vw, 42px);
+      line-height: 1;
+      text-transform: uppercase;
+      letter-spacing: -.06em;
+    }
+
+    .gravity-arrow {
+      position: relative;
+      display: block;
+      width: 68px;
+      height: 105px;
+      margin: 32px 0 22px;
+      filter: drop-shadow(0 0 19px var(--accent));
+      transition: transform .35s ease;
+    }
+
+    .gravity-arrow::before {
+      content: "";
+      position: absolute;
+      top: 4px;
+      left: 30px;
+      width: 8px;
+      height: 75px;
+      background: var(--accent);
+      border-radius: 5px;
+    }
+
+    .gravity-arrow::after {
+      content: "";
+      position: absolute;
+      bottom: 4px;
+      left: 6px;
+      border-left: 28px solid transparent;
+      border-right: 28px solid transparent;
+      border-top: 31px solid var(--accent);
+    }
+
+    [data-gravity="up"] .gravity-arrow { transform: rotate(180deg); }
+
+    .timer {
+      margin: 9px 0 0;
+      font-size: clamp(35px, 4vw, 60px);
+      font-weight: 720;
+      font-variant-numeric: tabular-nums;
+      line-height: 1;
+      letter-spacing: -.07em;
+    }
+
+    .timer small {
+      font-size: .37em;
+      font-weight: 550;
+      letter-spacing: 0;
+      color: var(--muted);
+    }
+
+    .rule {
+      width: 42px;
+      height: 2px;
+      margin-bottom: 19px;
+      background: var(--accent);
+    }
+
+    .description {
+      max-width: 210px;
+      margin: 9px 0 0;
+      color: #a8b8c2;
+      font-size: 13px;
+      line-height: 1.65;
+    }
+
+    .board-wrap { justify-self: center; }
+
+    .board-frame {
+      position: relative;
+      padding: 9px;
+      border: 1px solid #607a8a85;
+      border-radius: 9px;
+      background: #172631;
+      box-shadow: 0 24px 70px #0009, 0 0 0 5px #98c7dc0a, inset 0 0 0 1px #d5ecf21a;
+    }
+
+    .board-frame::after {
+      content: "";
+      position: absolute;
+      bottom: 2px;
+      left: 22%;
+      right: 22%;
+      height: 3px;
+      background: var(--accent);
+      box-shadow: 0 0 18px 3px var(--accent);
+      pointer-events: none;
+    }
+
+    [data-gravity="up"] .board-frame::after { bottom: auto; top: 2px; }
+
+    canvas {
+      display: block;
+      width: calc(12 * var(--cell));
+      height: calc(24 * var(--cell));
+      background: #0e1823;
+    }
+
+    .board-caption {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 9px 2px 0;
+    }
+
+    .board-caption .micro { font-size: 9px; }
+
+    .mode { color: var(--accent); }
+
+    .score {
+      margin: 14px 0 34px;
+      font-size: clamp(38px, 4vw, 64px);
+      font-weight: 740;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -.075em;
+      line-height: 1;
+    }
+
+    .stats {
+      display: flex;
+      justify-content: flex-end;
+      gap: 34px;
+    }
+
+    .stat-value {
+      display: block;
+      margin-top: 7px;
+      font-size: 24px;
+      font-weight: 700;
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+
+    #next { color: var(--next-color, #edf5f5); }
+
+    .controls {
+      padding-top: 20px;
+      border-top: 1px solid #7892a32d;
+    }
+
+    .controls p {
+      margin: 9px 0 0;
+      color: #b1c0ca;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    kbd {
+      display: inline-block;
+      min-width: 23px;
+      padding: 1px 5px;
+      border: 1px solid #62798b;
+      border-radius: 4px;
+      color: var(--ink);
+      text-align: center;
+      font: inherit;
+      font-size: 11px;
+    }
+
+    .footnote {
+      min-height: 26px;
+      border-top: 1px solid #7892a32d;
+      padding-top: 8px;
+      font-size: 10px;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .game-over {
+      position: absolute;
+      inset: 9px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      background: #07121de8;
+      text-align: center;
+    }
+
+    .game-over[hidden] { display: none; }
+
+    .game-over strong {
+      font-size: 32px;
+      line-height: 1;
+      letter-spacing: -.06em;
+      text-transform: uppercase;
+    }
+
+    .game-over span { color: var(--accent); font-size: 12px; letter-spacing: .14em; text-transform: uppercase; }
+
+    @media (max-width: 760px) {
+      :root { --cell: min(23px, calc((100dvh - 220px) / 24), calc((100vw - 48px) / 12)); }
+      .shell { padding: 12px 15px 9px; }
+      .masthead { min-height: 36px; padding-bottom: 8px; }
+      .brand { font-size: 16px; }
+      .masthead .eyebrow { font-size: 8px; text-align: right; }
+      .arena { grid-template-columns: 1fr 1fr; gap: 7px 12px; align-content: center; padding: 7px 0; }
+      .panel { padding: 0; justify-content: flex-start; }
+      .panel h2 { font-size: 18px; margin-top: 3px; }
+      .panel-left { grid-column: 1; grid-row: 1; }
+      .panel-right { grid-column: 2; grid-row: 1; }
+      .gravity-arrow { width: 20px; height: 31px; margin: 4px 0 2px; }
+      .gravity-arrow::before { width: 3px; height: 22px; top: 1px; left: 9px; }
+      .gravity-arrow::after { left: 1px; bottom: 1px; border-left-width: 9px; border-right-width: 9px; border-top-width: 11px; }
+      .timer { font-size: 23px; margin-top: 3px; }
+      .score { font-size: 27px; margin: 6px 0 5px; }
+      .stats { gap: 20px; }
+      .stat-value { font-size: 16px; margin-top: 3px; }
+      .panel .micro { font-size: 8px; }
+      .panel-left .panel-bottom, .controls { display: none; }
+      .board-wrap { grid-column: 1 / -1; grid-row: 2; }
+      .board-frame { padding: 6px; }
+      .game-over { inset: 6px; }
+      .board-caption { padding-top: 5px; }
+      .footnote { font-size: 8px; min-height: 21px; }
+    }
+
+    @media (max-height: 600px) and (min-width: 761px) {
+      .shell { padding-top: 9px; padding-bottom: 7px; }
+      .arena { padding: 5px 0; }
+      .panel { padding: 12px 0; }
+      .gravity-arrow { margin: 12px 0; height: 80px; }
+      .gravity-arrow::before { height: 54px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell" id="shell" data-gravity="down">
+    <header class="masthead">
+      <h1 class="brand">FALL <span>/</span> RISE</h1>
+      <span class="eyebrow">A game of shifting ground</span>
+    </header>
+
+    <div class="arena">
+      <section class="panel panel-left" aria-label="Gravity and flip timer">
+        <div>
+          <div class="micro">Current gravity</div>
+          <h2 id="direction">Down</h2>
+          <span class="gravity-arrow" role="img" aria-label="Gravity pointing down" id="gravity-arrow"></span>
+          <div class="micro">Next inversion in</div>
+          <div class="timer"><span id="countdown">20.0</span><small> s</small></div>
+        </div>
+        <div class="panel-bottom">
+          <div class="rule"></div>
+          <div class="micro">The rule</div>
+          <p class="description">Every 20 seconds, the world turns over. What you build stays where it landed.</p>
+        </div>
+      </section>
+
+      <div class="board-wrap">
+        <div class="board-frame">
+          <canvas id="board" width="384" height="768" aria-label="12 by 24 Tetris playing field"></canvas>
+          <div class="game-over" id="game-over" hidden>
+            <span>Field exhausted</span>
+            <strong>Game over</strong>
+            <span>Press R to restart</span>
+          </div>
+        </div>
+        <div class="board-caption">
+          <span class="micro">12 x 24 / dual gravity</span>
+          <span class="micro mode" id="mode">Autoplay active</span>
+        </div>
+      </div>
+
+      <section class="panel panel-right" aria-label="Score and controls">
+        <div>
+          <div class="micro">Score</div>
+          <div class="score" id="score">000000</div>
+          <div class="stats">
+            <div><span class="micro">Lines</span><span class="stat-value" id="lines">00</span></div>
+            <div><span class="micro">Next</span><span class="stat-value" id="next">-</span></div>
+          </div>
+        </div>
+        <div class="controls">
+          <div class="micro">Take control / any key</div>
+          <p><kbd>&larr;</kbd> <kbd>&rarr;</kbd> move &nbsp; <kbd>&uarr;</kbd> rotate</p>
+          <p><kbd>&darr;</kbd> soft drop &nbsp; <kbd>Space</kbd> hard drop</p>
+          <p><kbd>R</kbd> restart after game over</p>
+        </div>
+      </section>
+    </div>
+
+    <footer class="footnote"><span>Fixed seed / same opening every time</span><span>No floor is permanent</span></footer>
+  </main>
+
+  <script>
+    'use strict';
+
+    const WIDTH = 12;
+    const HEIGHT = 24;
+    const CELL = 32;
+    const FLIP_INTERVAL = 20;
+    const FALL_INTERVAL = 1;
+    const SHAPES = {
+      I: { color: '#65dcd5', cells: [[1, 1, 1, 1]] },
+      O: { color: '#f8ca70', cells: [[1, 1], [1, 1]] },
+      T: { color: '#bba3f3', cells: [[0, 1, 0], [1, 1, 1]] },
+      S: { color: '#94dc9c', cells: [[0, 1, 1], [1, 1, 0]] },
+      Z: { color: '#f28b96', cells: [[1, 1, 0], [0, 1, 1]] },
+      J: { color: '#78a7ed', cells: [[1, 0, 0], [1, 1, 1]] },
+      L: { color: '#f4a970', cells: [[0, 0, 1], [1, 1, 1]] }
+    };
+
+    const canvas = document.getElementById('board');
+    const ctx = canvas.getContext('2d');
+    const shell = document.getElementById('shell');
+    const countdownEl = document.getElementById('countdown');
+    const directionEl = document.getElementById('direction');
+    const arrowEl = document.getElementById('gravity-arrow');
+    const scoreEl = document.getElementById('score');
+    const linesEl = document.getElementById('lines');
+    const nextEl = document.getElementById('next');
+    const modeEl = document.getElementById('mode');
+    const gameOverEl = document.getElementById('game-over');
+
+    let board, active, bag, seed, gravity, targetX, score, lines;
+    let flipRemaining, fallElapsed, steerElapsed, softElapsed, gameOver;
+    let autoplay = true;
+    let softHeld = false;
+    let lastFrame = performance.now();
+
+    function random() {
+      seed ^= seed << 13;
+      seed ^= seed >>> 17;
+      seed ^= seed << 5;
+      return (seed >>> 0) / 4294967296;
+    }
+
+    function refillBag() {
+      const names = Object.keys(SHAPES);
+      for (let i = names.length - 1; i > 0; i--) {
+        const j = Math.floor(random() * (i + 1));
+        [names[i], names[j]] = [names[j], names[i]];
+      }
+      bag = names;
+    }
+
+    function fits(matrix, x, y) {
+      for (let row = 0; row < matrix.length; row++) {
+        for (let col = 0; col < matrix[row].length; col++) {
+          if (!matrix[row][col]) continue;
+          const bx = x + col;
+          const by = y + row;
+          if (bx < 0 || bx >= WIDTH || by < 0 || by >= HEIGHT || board[by][bx]) return false;
+        }
+      }
+      return true;
+    }
+
+    function chooseTarget() {
+      let bestColumn = 0;
+      let lowest = Infinity;
+      for (let col = 0; col < WIDTH; col++) {
+        let height = 0;
+        for (let row = 0; row < HEIGHT; row++) {
+          const cell = board[row][col];
+          if (cell && cell.side === gravity) {
+            height = Math.max(height, gravity === 1 ? HEIGHT - row : row + 1);
+          }
+        }
+        if (height < lowest) {
+          lowest = height;
+          bestColumn = col;
+        }
+      }
+      targetX = Math.min(bestColumn, WIDTH - active.matrix[0].length);
+    }
+
+    function spawn() {
+      if (!bag.length) refillBag();
+      const name = bag.pop();
+      if (!bag.length) refillBag();
+      const matrix = SHAPES[name].cells.map(row => row.slice());
+      const x = Math.floor((WIDTH - matrix[0].length) / 2);
+      let y = gravity === 1 ? 0 : HEIGHT - matrix.length;
+
+      // Enter from beyond the opposite-side pile, rather than inside it.
+      for (let row = 0; row < HEIGHT; row++) {
+        for (let col = 0; col < WIDTH; col++) {
+          if (board[row][col]?.side !== -gravity) continue;
+          y = gravity === 1 ? Math.max(y, row + 1) : Math.min(y, row - matrix.length);
+        }
+      }
+
+      if (!fits(matrix, x, y)) {
+        active = null;
+        gameOver = true;
+        gameOverEl.hidden = false;
+        return;
+      }
+      active = { name, matrix, x, y };
+      fallElapsed = 0;
+      chooseTarget();
+    }
+
+    function clearRows() {
+      const remaining = board.filter(row => !row.every(Boolean));
+      const cleared = HEIGHT - remaining.length;
+      if (!cleared) return;
+      const empty = Array.from({ length: cleared }, () => Array(WIDTH).fill(null));
+      board = gravity === 1 ? [...empty, ...remaining] : [...remaining, ...empty];
+      lines += cleared;
+      score += [0, 100, 300, 500, 800][cleared] ?? cleared * 200;
+    }
+
+    function lock() {
+      for (let row = 0; row < active.matrix.length; row++) {
+        for (let col = 0; col < active.matrix[row].length; col++) {
+          if (active.matrix[row][col]) {
+            board[active.y + row][active.x + col] = { color: SHAPES[active.name].color, side: gravity };
+          }
+        }
+      }
+      clearRows();
+      spawn();
+    }
+
+    function step() {
+      if (!active || gameOver) return;
+      if (fits(active.matrix, active.x, active.y + gravity)) active.y += gravity;
+      else lock();
+    }
+
+    function rotate() {
+      const old = active.matrix;
+      const turned = old[0].map((_, col) => old.map(row => row[col]).reverse());
+      for (const dx of [0, -1, 1, -2, 2]) {
+        if (fits(turned, active.x + dx, active.y)) {
+          active.matrix = turned;
+          active.x += dx;
+          return;
+        }
+      }
+    }
+
+    function reset() {
+      seed = 0xC0FFEE;
+      bag = [];
+      board = Array.from({ length: HEIGHT }, () => Array(WIDTH).fill(null));
+      const floor = ['##.#########', '#####.######', '#######.####', '#.##########'];
+      for (let row = 0; row < floor.length; row++) {
+        for (let col = 0; col < WIDTH; col++) {
+          if (floor[row][col] === '#') board[HEIGHT - floor.length + row][col] = { color: '#526579', side: 1 };
+        }
+      }
+      gravity = 1;
+      score = 0;
+      lines = 0;
+      flipRemaining = FLIP_INTERVAL;
+      fallElapsed = 0;
+      steerElapsed = 0;
+      softElapsed = 0;
+      softHeld = false;
+      gameOver = false;
+      gameOverEl.hidden = true;
+      shell.dataset.gravity = 'down';
+      spawn();
+      updateHud();
+    }
+
+    function updateHud() {
+      countdownEl.textContent = Math.max(0, flipRemaining).toFixed(1);
+      directionEl.textContent = gravity === 1 ? 'Down' : 'Up';
+      arrowEl.setAttribute('aria-label', `Gravity pointing ${gravity === 1 ? 'down' : 'up'}`);
+      scoreEl.textContent = String(score).padStart(6, '0');
+      linesEl.textContent = String(lines).padStart(2, '0');
+      nextEl.textContent = bag[bag.length - 1];
+      nextEl.style.setProperty('--next-color', SHAPES[bag[bag.length - 1]].color);
+      modeEl.textContent = gameOver ? 'Run complete' : autoplay ? 'Autoplay active' : 'Keyboard control';
+    }
+
+    function drawCell(x, y, color) {
+      const px = x * CELL + 2;
+      const py = y * CELL + 2;
+      ctx.fillStyle = '#06101b';
+      ctx.fillRect(px + 1, py + 3, CELL - 4, CELL - 4);
+      ctx.fillStyle = color;
+      ctx.fillRect(px, py, CELL - 4, CELL - 4);
+      ctx.fillStyle = '#ffffff3d';
+      ctx.fillRect(px + 3, py + 3, CELL - 10, 3);
+      ctx.fillRect(px + 3, py + 6, 3, CELL - 13);
+      ctx.fillStyle = '#07121c42';
+      ctx.fillRect(px + 3, py + CELL - 8, CELL - 7, 4);
+      ctx.fillRect(px + CELL - 8, py + 5, 4, CELL - 11);
+    }
+
+    function draw() {
+      ctx.fillStyle = '#101c28';
+      ctx.fillRect(0, 0, WIDTH * CELL, HEIGHT * CELL);
+      ctx.strokeStyle = '#b4d2e013';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (let x = 1; x < WIDTH; x++) {
+        ctx.moveTo(x * CELL + .5, 0);
+        ctx.lineTo(x * CELL + .5, HEIGHT * CELL);
+      }
+      for (let y = 1; y < HEIGHT; y++) {
+        ctx.moveTo(0, y * CELL + .5);
+        ctx.lineTo(WIDTH * CELL, y * CELL + .5);
+      }
+      ctx.stroke();
+
+      for (let row = 0; row < HEIGHT; row++) {
+        for (let col = 0; col < WIDTH; col++) {
+          if (board[row][col]) drawCell(col, row, board[row][col].color);
+        }
+      }
+
+      if (!active) return;
+      let landing = active.y;
+      while (fits(active.matrix, active.x, landing + gravity)) landing += gravity;
+      if (landing !== active.y) {
+        ctx.strokeStyle = '#d7eff672';
+        ctx.lineWidth = 1.5;
+        for (let row = 0; row < active.matrix.length; row++) {
+          for (let col = 0; col < active.matrix[row].length; col++) {
+            if (active.matrix[row][col]) ctx.strokeRect((active.x + col) * CELL + 5, (landing + row) * CELL + 5, CELL - 10, CELL - 10);
+          }
+        }
+      }
+
+      const offset = fits(active.matrix, active.x, active.y + gravity) ? gravity * fallElapsed / FALL_INTERVAL : 0;
+      for (let row = 0; row < active.matrix.length; row++) {
+        for (let col = 0; col < active.matrix[row].length; col++) {
+          if (active.matrix[row][col]) drawCell(active.x + col, active.y + row + offset, SHAPES[active.name].color);
+        }
+      }
+    }
+
+    function resizeCanvas() {
+      const rect = canvas.getBoundingClientRect();
+      const ratio = window.devicePixelRatio || 1;
+      canvas.width = Math.round(rect.width * ratio);
+      canvas.height = Math.round(rect.height * ratio);
+      ctx.setTransform(canvas.width / (WIDTH * CELL), 0, 0, canvas.height / (HEIGHT * CELL), 0, 0);
+      draw();
+    }
+
+    function frame(now) {
+      const elapsed = Math.max(0, (now - lastFrame) / 1000);
+      const dt = Math.min(elapsed, .1);
+      lastFrame = now;
+      if (!gameOver) {
+        flipRemaining -= elapsed;
+        while (flipRemaining <= 0) {
+          flipRemaining += FLIP_INTERVAL;
+          gravity *= -1;
+          shell.dataset.gravity = gravity === 1 ? 'down' : 'up';
+          fallElapsed = 0;
+          if (active) chooseTarget();
+        }
+
+        if (autoplay && active) {
+          steerElapsed += dt;
+          if (steerElapsed >= .11) {
+            steerElapsed %= .11;
+            const dx = Math.sign(targetX - active.x);
+            if (dx && fits(active.matrix, active.x + dx, active.y)) active.x += dx;
+          }
+        }
+
+        if (softHeld) {
+          softElapsed += dt;
+          if (softElapsed >= .065) {
+            softElapsed %= .065;
+            step();
+            fallElapsed = 0;
+          }
+        } else {
+          fallElapsed += dt;
+          if (fallElapsed >= FALL_INTERVAL) {
+            fallElapsed %= FALL_INTERVAL;
+            step();
+          }
+        }
+      }
+      updateHud();
+      draw();
+      requestAnimationFrame(frame);
+    }
+
+    window.addEventListener('keydown', event => {
+      autoplay = false;
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space'].includes(event.code)) event.preventDefault();
+      if (gameOver) {
+        if (event.key.toLowerCase() === 'r') reset();
+        else updateHud();
+        return;
+      }
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        const dx = event.key === 'ArrowLeft' ? -1 : 1;
+        if (fits(active.matrix, active.x + dx, active.y)) active.x += dx;
+      } else if (event.key === 'ArrowUp' && !event.repeat) {
+        rotate();
+      } else if (event.key === 'ArrowDown') {
+        if (!softHeld) {
+          softHeld = true;
+          softElapsed = 0;
+          step();
+          fallElapsed = 0;
+        }
+      } else if (event.code === 'Space' && !event.repeat) {
+        while (fits(active.matrix, active.x, active.y + gravity)) active.y += gravity;
+        lock();
+      }
+      updateHud();
+    });
+
+    window.addEventListener('keyup', event => {
+      if (event.key === 'ArrowDown') softHeld = false;
+    });
+    window.addEventListener('blur', () => { softHeld = false; });
+    window.addEventListener('resize', resizeCanvas);
+
+    reset();
+    resizeCanvas();
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
